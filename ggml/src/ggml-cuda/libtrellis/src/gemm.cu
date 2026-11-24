@@ -620,6 +620,7 @@ template <int K>
 cudaError_t launch_pf_i8(const Pf& a, int tiling, cudaStream_t s) {
     if (tiling == T128X4) return launch_t_i8<K, 128, 4, 2>(a, s);
     if (tiling == T128X8) return launch_t_i8<K, 128, 8, 2>(a, s);  // CK=8 with 2 CTAs/SM (S=2): fewer barriers, more MMA per stage
+    if (tiling == 4) return launch_t_i8<K, 128, 8, 1>(a, s);        // one CTA, 4 stages
     return launch_t_i8<K, 64, 8, 2>(a, s);
 }
 
@@ -646,7 +647,7 @@ int pick_tiling(int rows, int nt, int splits) {
 int pick_tiling_i8() {
     if (const char * e = getenv("TQ_TILING")) {
         const int t = atoi(e);
-        if (t >= 0 && t <= 2) return t;
+        if (t >= 0 && t <= 4) return t;
     }
     return T128X8;
 }
