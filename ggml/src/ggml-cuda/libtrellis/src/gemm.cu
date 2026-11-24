@@ -136,11 +136,11 @@ constexpr int SMEM_SM = 102400;          // shared memory per SM to plan with (s
 constexpr int SMEM_CTA = 101376 - 64;    // per CTA
 
 // K bits, TT rows per CTA, CK k-tiles per stage, CPS CTAs per SM: the stage size and the stages that fit (at most 4)
-template <int K, int TT, int CK, int CPS>
+template <int K, int TT, int CK, int CPS, bool I8 = false>
 struct Tile5 {
     static constexpr int WORDS = 8 * K;
-    static constexpr int CODE_W = W5 * CK * WORDS;           // codes [tile][k-tile][8K]
-    static constexpr int STAGE = CODE_W + TT / 8 * CK * 64;  // + activations [group][k-tile][64]
+    static constexpr int CODE_W = W5 * CK * WORDS;                          // codes [tile][k-tile][8K]
+    static constexpr int STAGE = CODE_W + TT / 8 * CK * (I8 ? 32 : 64);     // + activations (int8 halves the words)
     static constexpr int STAGE_BYTES = STAGE * 4;
     static constexpr int fit() {
         for (int s = 4; s >= 2; --s)
@@ -383,7 +383,7 @@ __device__ __forceinline__ void mma16832(int (&d)[4], const uint32_t (&a)[4], ui
 // Weights are the exact integer grid v; activations are int8 with the row scale 2^(7-e) (see prologue_k).
 template <int K, int TT, int CK, int CPS>
 __global__ void __launch_bounds__(32 * W5, CPS) pf_k_i8(const Pf a) {
-    using T5 = Tile5<K, TT, CK, CPS>;
+    using T5 = Tile5<K, TT, CK, CPS, true>;
     constexpr int WORDS = T5::WORDS, CODE_W = T5::CODE_W, STAGE = T5::STAGE, S = T5::S;
     constexpr int GT = TT / 8;
     extern __shared__ __align__(16) uint32_t sm[];
@@ -569,7 +569,7 @@ cudaError_t launch_pf(const Pf& a, int tiling, cudaStream_t s) {
 
 template <int K, int TT, int CK, int CPS>
 cudaError_t launch_t_i8(const Pf& a, cudaStream_t s) {
-    using T5 = Tile5<K, TT, CK, CPS>;
+    using T5 = Tile5<K, TT, CK, CPS, true>;
     static std::atomic<bool> configured[64] = {};
     int dev = 0;
     cudaGetDevice(&dev);

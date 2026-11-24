@@ -64,3 +64,14 @@ TQ_I8=1 ./build/bin/llama-server -m Qwen3.8-27B-NariQ-3.0bpw.gguf --mmproj ... \
 - At 1110 tok/s the inner loop is no longer MMA-bound; the remaining time is decode,
   cp.async traffic and the prologue. Further gains need pipelining work, not bigger MMA.
 - `splits > 1` matrices stay FP16; they are the small projections (few percent of time).
+
+Things that were measured and did **not** help (pp8192, INT8 path):
+- `TQ_TILING=1|0`: 1055 / 1002 — the default 128x4 picker is already best.
+- Deeper stages (`Tile5` int8 stage size -> S=4 instead of 2): 1108.8, no change.
+  Latency is already hidden; the limit is the decode's ALU issue rate.
+- `-ub 1024`: 1114.8; `-ub 768`: 1117.3 (marginally best); `-ub 2048`: OOM.
+
+nsys breakdown at 1110 tok/s (total GPU 7.12 s for 8192 tokens, was 12.07 s):
+`pf_k_i8` 59.9%, `rht_cta_k` 8.6%, `gdn_single` 5.6%, `flash_attn` 4.9%,
+`silu` 4.5%, `prologue_k` 4.3%, `trellis_gather` 3.9%. The INT8 path covers 99.7%
+of the projection time; only 0.3% of `pf_k` (FP16) remains.
