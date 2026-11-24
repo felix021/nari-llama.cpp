@@ -103,7 +103,9 @@ __global__ void __launch_bounds__(256) prologue_k(const T* __restrict__ x, int64
     const int e = 14 - x2;
     if (threadIdx.x == 0) xs[t] = ldexpf(1.f, -e);
     __half* base = xf + (size_t)(t / 8) * 1024 + (t % 8) * 16;  // [c][group][k-tile][token][16]
-    int8_t* base8 = xf8 != nullptr ? xf8 + (size_t)(t / 8) * 1024 + (t % 8) * 16 : nullptr;  // same layout, int8
+    // INT8: 32 bytes per token per 32-column block, so a lane's two B words (k 4q..4q+3 and k 16+4q..16+4q+3)
+    // are adjacent and the GEMM reads them with one LDS.64: [k32-block][group][token][32]
+    int8_t* base8 = xf8 != nullptr ? xf8 + (size_t)(t / 8) * 1024 + (t % 8) * 32 : nullptr;
     const size_t cstep = (size_t)groups * 1024;
     for (int blk = warp; blk < nb; blk += 8) {
         float v[4];
@@ -117,10 +119,10 @@ __global__ void __launch_bounds__(256) prologue_k(const T* __restrict__ x, int64
         for (int i = 0; i < 4; ++i) {
             const int k = lane + 32 * i;
             if (base8 != nullptr) {
-                // INT8: sequential [k-tile][token][16 int8]; e - 7 puts max |u| at 2^6..2^7
+                // INT8: e - 7 puts max |u| at 2^6..2^7; byte (k%4) of word (k/4 within a k32 block) of its token
                 int q = __float2int_rn(ldexpf(v[i], e - 7));
                 q = q < -127 ? -127 : (q > 127 ? 127 : q);
-                base8[blk * cstep + (k / 16) * 128 + (k % 16)] = static_cast<int8_t>(q);
+                base8[blk * cstep + (k / 32) * 256 + ((k % 16) / 4) * 8 + ((k % 32) / 16) * 4 + (k % 4)] = static_cast<int8_t>(q);
             } else {
                 base[blk * cstep + (k / 16) * 128 + tq::frag_pos(k % 16)] = __float2half_rn(ldexpf(v[i], e));
             }
@@ -444,7 +446,34 @@ __global__ void __launch_bounds__(32 * W5, CPS) pf_k_i8(const Pf a) {
     // q >= 2 reads that lane's second column pair (v2,v3 / v6,v7)
     const int src0 = (lane & ~3) | ((2 * q) & 3), src1 = (lane & ~3) | ((2 * q + 1) & 3);
     const bool usehi = q >= 2;
+    // K <= 3: the four states this lane needs from one source span (5K + 16 <= 31 bits) fit one 32-bit window,
+    // so both A registers are decoded in place and the shuffle disappears
+    int dl[2], dh[2], ds[2];
+    if constexpr (K <= 3) {
+#pragma unroll
+        for (int side = 0; side < 2; ++side) {
+            const int src = (lane & ~3) | ((2 * q + side) & 3);
+            const int end = ((8 * src + (q >= 2 ? 2 : 0) + 6) * K) % (256 * K);
+            dh[side] = (end - 32 + 256 * K >> 5) % (8 * K);
+            dl[side] = (dh[side] + 1) % (8 * K);
+            ds[side] = 32 - (end & 31);
+        }
+    }
     auto decode_tile = [&](const uint32_t* tw, int d, uint32_t (&a0)[2]) {
+        if constexpr (K <= 3) {
+            int lo[4], hi[4];
+#pragma unroll
+            for (int side = 0; side < 2; ++side) {
+                const uint32_t r = __funnelshift_rc(tw[d * WORDS + dl[side]], tw[d * WORDS + dh[side]], ds[side]);
+                lo[2 * side] = tq::v_int(tq::low16<5 * K>(r), a.mult);
+                lo[2 * side + 1] = tq::v_int(tq::low16<4 * K>(r), a.mult);
+                hi[2 * side] = tq::v_int(tq::low16<K>(r), a.mult);
+                hi[2 * side + 1] = tq::v_int(tq::low16<0>(r), a.mult);
+            }
+            a0[0] = pack4(lo[0], lo[1], lo[2], lo[3]);  // (g, 4q..4q+3)
+            a0[1] = pack4(hi[0], hi[1], hi[2], hi[3]);  // (g+8, 4q..4q+3)
+            return;
+        }
         uint32_t w[2 * tq::Plan<K>::ANCH];
 #pragma unroll
         for (int x = 0; x < tq::Plan<K>::ANCH; ++x) {
@@ -455,11 +484,12 @@ __global__ void __launch_bounds__(32 * W5, CPS) pf_k_i8(const Pf a) {
         tq::decode_ints<K>(w, plan, a.mult, v);
         const uint32_t olo = pack4(v[0], v[1], v[4], v[5]);  // (g,2q),(g,2q+1),(g+8,2q),(g+8,2q+1)
         const uint32_t ohi = pack4(v[2], v[3], v[6], v[7]);  // cols +8
-        const uint32_t l0 = __shfl_sync(0xffffffffu, olo, src0), h0 = __shfl_sync(0xffffffffu, ohi, src0);
-        const uint32_t l1 = __shfl_sync(0xffffffffu, olo, src1), h1 = __shfl_sync(0xffffffffu, ohi, src1);
-        const uint32_t s0 = usehi ? h0 : l0, s1 = usehi ? h1 : l1;
-        a0[0] = (s0 & 0xFFFFu) | ((s1 & 0xFFFFu) << 16);          // (g, 4q..4q+3)
-        a0[1] = ((s0 >> 16) & 0xFFFFu) | ((s1 >> 16) & 0xFFFFu) << 16;  // (g+8, 4q..4q+3)
+        // K > 3: two shuffles (odd q lanes carry the other half) + one byte permute per register
+        const uint32_t x = __shfl_sync(0xffffffffu, (q & 1) ? ohi : olo, usehi ? src1 : src0);
+        const uint32_t y = __shfl_sync(0xffffffffu, (q & 1) ? olo : ohi, usehi ? src0 : src1);
+        const uint32_t even = usehi ? y : x, odd = usehi ? x : y;
+        a0[0] = __byte_perm(even, odd, 0x5410);  // (g, 4q..4q+3)
+        a0[1] = __byte_perm(even, odd, 0x7632);  // (g+8, 4q..4q+3)
     };
     auto kloop = [&](auto full) {
         constexpr bool FULL = decltype(full)::value;
@@ -488,9 +518,8 @@ __global__ void __launch_bounds__(32 * W5, CPS) pf_k_i8(const Pf a) {
 #pragma unroll
                 for (int r = 0; r < GT; ++r)
                     if (FULL || r < rg) {
-                        const uint32_t b0 = xb[(r * CK + d) * 32 + lane];
-                        const uint32_t b1 = xb[(r * CK + d + 1) * 32 + lane];
-                        mma16832(acc[r], ap, b0, b1);
+                        const uint2 pair = reinterpret_cast<const uint2*>(xb)[((r * CK + d) / 2) * 32 + lane];
+                        mma16832(acc[r], ap, pair.x, pair.y);
                     }
                 if (d + 2 < CK) {
 #pragma unroll
@@ -590,7 +619,7 @@ cudaError_t launch_t_i8(const Pf& a, cudaStream_t s) {
 template <int K>
 cudaError_t launch_pf_i8(const Pf& a, int tiling, cudaStream_t s) {
     if (tiling == T128X4) return launch_t_i8<K, 128, 4, 2>(a, s);
-    if (tiling == T128X8) return launch_t_i8<K, 128, 8, 1>(a, s);
+    if (tiling == T128X8) return launch_t_i8<K, 128, 8, 2>(a, s);  // CK=8 with 2 CTAs/SM (S=2): fewer barriers, more MMA per stage
     return launch_t_i8<K, 64, 8, 2>(a, s);
 }
 
@@ -611,6 +640,15 @@ int pick_tiling(int rows, int nt, int splits) {
     const float t_c8 = (float)((c128 + sms - 1) / sms), t_x2 = load(c128, 1.8f, 1.03f), t_64 = load(c64, 1.1f, 0.6f);
     if (t_64 < t_x2 && t_64 < t_c8) return T64X8;
     return t_c8 < t_x2 ? T128X8 : T128X4;
+}
+
+// INT8 kernel: 128 x 8 with two CTAs per SM (measured best on the 36-SM part: 1303 vs 1263 for 128 x 4)
+int pick_tiling_i8() {
+    if (const char * e = getenv("TQ_TILING")) {
+        const int t = atoi(e);
+        if (t >= 0 && t <= 2) return t;
+    }
+    return T128X8;
 }
 
 // Split-K for grids that leave the GPU idle (few column blocks: in_proj_a/b's 48 outputs, k/v_proj's 1,024, at prefill
@@ -688,7 +726,7 @@ int fused(const tq_matrix* m, const void* x, tq_dtype x_type, int64_t x_stride, 
     a.post = post, a.had = (flags & TQ_HAD128_OUT) ? 1 : 0;
     a.i8 = xf8 != nullptr ? 1 : 0;
     a.out = out, a.out_type = out_type, a.out_stride = out_stride;
-    const int tiling = pick_tiling(rows, a.nt, a.splits);
+    const int tiling = a.i8 ? pick_tiling_i8() : pick_tiling(rows, a.nt, a.splits);
     cudaError_t e;
     if (a.i8) {
         switch (m->bits) {

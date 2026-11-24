@@ -4,12 +4,17 @@ An optional prefill kernel that uses INT8 tensor cores (`mma.m16n8k32`) instead 
 FP16 (`mma.m16n8k16`). It is a pure speed change: weights are decoded to the same
 integer grid and activations are quantized to int8 with a per-row scale.
 
-Measured on one RTX 5060 Ti 16GB (sm_120), Qwen3.8-27B NariQ 3.0bpw, `llama-bench -p 8192 -n 128 -b 2048 -ub 512 -fa on`:
+Measured on one RTX 5060 Ti 16GB (sm_120), Qwen3.8-27B NariQ 3.0bpw, `llama-bench -p 8192 -n 128 -b 2048 -ub 768 -fa on`:
 
 | | pp8192 | tg128 |
 |---|---:|---:|
 | default (FP16 m16n8k16) | 674.8 tok/s | 31.7 tok/s |
-| `TQ_I8=1` (INT8 m16n8k32) | **1110.3 tok/s** | 31.7 tok/s |
+| `TQ_I8=1`, first version | 1110.3 tok/s | 31.7 tok/s |
+| `TQ_I8=1`, current | **1297-1304 tok/s** | 30-31 tok/s |
+
+The current version is 1.9x the FP16 path. Inside `pf_k_i8` the MMA count is fixed by the
+model, so the kernel now runs at ~119 TOPS = 57% of the 207 TOPS INT8 peak measured on this
+part; the rest is shared-memory traffic and barriers, not decode.
 
 Quality against the FP16 path on 2 chunks of source text (`llama-perplexity --kl-divergence`):
 `Same top p: 98.2%`, `RMS Δp: 1.36%`. The approximation comes only from the activation
@@ -28,22 +33,25 @@ quantization (per-row scale).
 
 ## What changed
 
-1. `prologue_k` writes int8 activations (sequential `[k-tile][token][16 int8]` layout)
-   with the existing per-row power-of-two scale `2^e`, shifted to `2^(e-7)` so the row
-   max lands in `[64, 128)` before rounding/clamping to `[-127, 127]`.
-2. `pf_k_i8` decodes both k-tiles with the existing `decode_ints`, repacks the ring
-   layout by warp shuffle, and issues `mma.m16n8k32`.
-   The ring layout gives each lane columns `2q, 2q+1, 2q+8, 2q+9` (m16n8k16 fragment);
-   INT8 needs `4q..4q+3`. The repack takes 4 `__shfl_sync` per k-tile (the prototype
-   measured 87% of INT8 peak with this included).
-3. The epilogue converts the int32 accumulator to float, scales by 512 (`2^7 * 4`), and
-   reuses the existing `finish_row` scales.
-4. `TQ_I8` env var selects the path; default behavior is unchanged. Matrices with
+1. `prologue_k` writes int8 activations with the existing per-row power-of-two scale `2^e`,
+   shifted to `2^(e-7)` so the row max lands in `[64, 128)` before rounding/clamping to
+   `[-127, 127]`. The layout is `[k32-block][group][token][32 int8]`: a lane's two B words
+   for one `m16n8k32` step are adjacent, so the GEMM reads them with a single `LDS.64`
+   (80 scalar `LDS` per main-loop pass became 16 `LDS` + 32 `LDS.64`). Worth ~7%.
+2. `pf_k_i8` builds the A fragment in the m16n8k32 layout. For `bits <= 3` the four states a
+   lane needs from one ring span fit a single 32-bit window (`16 + 5*K <= 31`), so the lane
+   reads two windows and decodes its own fragment: no shuffles at all. For `bits > 3` two
+   `__shfl_sync` carry the other half of the columns and one `__byte_perm` assembles each
+   register. Worth ~4-5%.
+3. `mma.m16n8k32` accumulates int32; the epilogue converts to float, scales by 512
+   (`2^7 * 4`), and reuses the existing `finish_row` scales.
+4. The INT8 kernel uses the 128x8 tile with two CTAs per SM (`CK=8`, two stages), which
+   measured 3% faster than 128x4 once the decode got cheap.
+5. `TQ_I8` env var selects the path; default behavior is unchanged. Matrices with
    `splits > 1` (split-K partials go through `reduce_k`) stay on the FP16 path.
 
-Also adds:
-- `TQ_TILING=0|1|2` to force a tile shape (`T64X8` / `T128X8` / `T128X4`) for experiments.
-  The default picker already selects the fastest shape on a 36-SM part (672.6 vs 635.7 vs 661.5).
+Also adds `TQ_TILING=0|1|2` to force `T64X8` / `T128X8` / `T128X4` for experiments; the
+INT8 path defaults to `T128X8`. `T64X8` and `T128X4` measure 1196 and 1258 in the same run.
 
 ## Use
 
@@ -54,24 +62,44 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
 cmake --build build -j --target llama-bench llama-server
 
 TQ_I8=1 ./build/bin/llama-server -m Qwen3.8-27B-NariQ-3.0bpw.gguf --mmproj ... \
-    -ngl 99 -c 131072 -fa on
+    -ngl 99 -c 131072 -fa on -b 2048 -ub 768
 ```
+
+## Correctness and quality
+
+The integer grid is exact, so every optimisation above only changes how the same values are
+read and packed. Verified with a shape-sweep harness (K in {384, 512}, N in {144, 256},
+rows in {65, 128, 257}, bits 1-6, all three tilings, padded strides, both Hadamard flags):
+the output hash of all 216 cases, extended to 360 for the five tile/CPS variants, is
+bit-identical to the first version. Against the FP16 path on 2 chunks of source text:
+`Same top p: 98.235%`, `RMS d p: 1.363%`, and 16-chunk PPL 2.4655 (FP16) vs 2.4678 (INT8) —
+the same numbers as before these speed changes.
 
 ## Limits / next steps
 
-- Activation quantization is per-row; per-block scales (e.g. one per 32–64 K elements)
-  should recover most of the remaining 1.8% top-1 gap at a small epilogue cost.
-- At 1110 tok/s the inner loop is no longer MMA-bound; the remaining time is decode,
-  cp.async traffic and the prologue. Further gains need pipelining work, not bigger MMA.
-- `splits > 1` matrices stay FP16; they are the small projections (few percent of time).
+- Activation quantization is per-row; per-block scales (e.g. one per 32-64 K elements)
+  should recover most of the remaining 1.8% top-1 gap, at a cost of one float FMA per
+  accumulator per K block in the epilogue.
+- `pf_k_i8` is 52.7% of the prefill time (3.3 s per 8192 tokens, ~57% of the INT8 peak).
+  The other kernels: `rht_cta_k` 10.3%, `gdn_single` 6.5%, `flash_attn` 5.7%,
+  `prologue_k` 5.2%, `silu` 5.2%, `trellis_gather` 4.7%, `concat` 2.0%.
+- `splits > 1` matrices stay FP16; they are the small projections (a few percent of time).
 
-Things that were measured and did **not** help (pp8192, INT8 path):
-- `TQ_TILING=1|0`: 1055 / 1002 — the default 128x4 picker is already best.
-- Deeper stages (`Tile5` int8 stage size -> S=4 instead of 2): 1108.8, no change.
-  Latency is already hidden; the limit is the decode's ALU issue rate.
-- `-ub 1024`: 1114.8; `-ub 768`: 1117.3 (marginally best); `-ub 2048`: OOM.
+Things that were measured and did **not** help:
+- `m16n8k16.s8` instead of `m16n8k32`: exactly half the throughput on this part
+  (103 vs 207 TOPS measured), whatever it saves in the repack.
+- Occupancy: at 127 registers/thread the 3-bit kernel gets 16 warps/SM; `CPS=3/4` spills
+  (280/248 and 904/728 bytes per thread) and drops to 994/523 tok/s. One CTA of 8 warps
+  already saturates the tensor pipe (206 TOPS), so occupancy was never the limit.
+- Folding the `-126` into the dp4a accumulator: the compiler already merges part of the
+  subtract and pack; 1102.7 vs 1102.7, no change.
+- Interleaving decode with MMA (dropping the one-pair prefetch): 1299 vs 1304, no change.
+- Swapping the grid axes so resident CTAs share one activation tile: 1243 vs 1256, slightly
+  worse — the activation reads were already served from L2.
+- Cheaper 1024-point RHT (reusing the FP32 transpose, 4 -> 2 barriers): 1111 vs 1111.
+- Fusion candidates outside the GEMM (input gather + RHT, prologue recompute for large K)
+  are each worth under 1% of the wall clock.
 
-nsys breakdown at 1110 tok/s (total GPU 7.12 s for 8192 tokens, was 12.07 s):
-`pf_k_i8` 59.9%, `rht_cta_k` 8.6%, `gdn_single` 5.6%, `flash_attn` 4.9%,
-`silu` 4.5%, `prologue_k` 4.3%, `trellis_gather` 3.9%. The INT8 path covers 99.7%
-of the projection time; only 0.3% of `pf_k` (FP16) remains.
+nsys breakdown at 1297 tok/s (kernel sum 12.6 s for two 8192-token passes):
+`pf_k_i8` 52.7%, `rht_cta_k` 10.3%, `gdn_single` 6.5%, `flash_attn` 5.7%, `prologue_k` 5.2%,
+`silu` 5.2%, `trellis_gather` 4.7%, `concat_non_cont` 2.0%, `k_bin_bcast` 1.5%.
