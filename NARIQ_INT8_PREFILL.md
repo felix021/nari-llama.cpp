@@ -10,11 +10,11 @@ Measured on one RTX 5060 Ti 16GB (sm_120), Qwen3.8-27B NariQ 3.0bpw, `llama-benc
 |---|---:|---:|
 | default (FP16 m16n8k16) | 674.8 tok/s | 31.7 tok/s |
 | `TQ_I8=1`, first version | 1110.3 tok/s | 31.7 tok/s |
-| `TQ_I8=1`, current | **1297-1304 tok/s** | 30-31 tok/s |
+| `TQ_I8=1`, current | **1417-1424 tok/s** | 32 tok/s |
 
-The current version is 1.9x the FP16 path. Inside `pf_k_i8` the MMA count is fixed by the
-model, so the kernel now runs at ~119 TOPS = 57% of the 207 TOPS INT8 peak measured on this
-part; the rest is shared-memory traffic and barriers, not decode.
+The current version is 2.1x the FP16 path. Inside `pf_k_i8` the MMA count is fixed by the
+model, so the kernel runs at ~125 TOPS = 60% of the 207 TOPS INT8 peak measured on this part;
+the rest is shared-memory traffic, cp.async and barriers, not decode.
 
 Quality against the FP16 path on 2 chunks of source text (`llama-perplexity --kl-divergence`):
 `Same top p: 98.2%`, `RMS Δp: 1.36%`. The approximation comes only from the activation
@@ -47,7 +47,11 @@ quantization (per-row scale).
    (`2^7 * 4`), and reuses the existing `finish_row` scales.
 4. The INT8 kernel uses the 128x8 tile with two CTAs per SM (`CK=8`, two stages), which
    measured 3% faster than 128x4 once the decode got cheap.
-5. `TQ_I8` env var selects the path; default behavior is unchanged. Matrices with
+5. The MLP chain (up/gate products, both output rotations, swiglu, down's input rotation) runs
+   as one kernel at any row count. It was gated to one column because the products went through
+   the GEMV group entry point; above one column they are plain `tq_gemm` calls into the same
+   fused kernel, which is bit-identical and replaces three passes over gate/up. Worth ~9%.
+6. `TQ_I8` env var selects the path; default behavior is unchanged. Matrices with
    `splits > 1` (split-K partials go through `reduce_k`) stay on the FP16 path.
 
 Also adds `TQ_TILING=0|1|2` to force `T64X8` / `T128X8` / `T128X4` for experiments; the
@@ -80,9 +84,9 @@ the same numbers as before these speed changes.
 - Activation quantization is per-row; per-block scales (e.g. one per 32-64 K elements)
   should recover most of the remaining 1.8% top-1 gap, at a cost of one float FMA per
   accumulator per K block in the epilogue.
-- `pf_k_i8` is 52.7% of the prefill time (3.3 s per 8192 tokens, ~57% of the INT8 peak).
+- `pf_k_i8` is 55.5% of the prefill time (3.1 s per 8192 tokens, ~60% of the INT8 peak).
   The other kernels: `rht_cta_k` 10.3%, `gdn_single` 6.5%, `flash_attn` 5.7%,
-  `prologue_k` 5.2%, `silu` 5.2%, `trellis_gather` 4.7%, `concat` 2.0%.
+  smaller kernels.
 - `splits > 1` matrices stay FP16; they are the small projections (a few percent of time).
 
 Things that were measured and did **not** help:
@@ -97,6 +101,11 @@ Things that were measured and did **not** help:
 - Swapping the grid axes so resident CTAs share one activation tile: 1243 vs 1256, slightly
   worse — the activation reads were already served from L2.
 - Cheaper 1024-point RHT (reusing the FP32 transpose, 4 -> 2 barriers): 1111 vs 1111.
+- Dropping the GEMM's activation reads entirely (a constant B operand) only reaches 1464 vs
+  1418: the shared-memory B traffic is 3% of the run, so a wider n-tile (more outputs per CTA)
+  has nothing to win.
+- Sharing one prologue between the projections of one x (they look like an input group): the
+  per-input scale `pre` differs per matrix, so the quantized activations differ too.
 - Fusion candidates outside the GEMM (input gather + RHT, prologue recompute for large K)
   are each worth under 1% of the wall clock.
 
