@@ -79,6 +79,26 @@ bit-identical to the first version. Against the FP16 path on 2 chunks of source 
 `Same top p: 98.235%`, `RMS d p: 1.363%`, and 16-chunk PPL 2.4655 (FP16) vs 2.4678 (INT8) —
 the same numbers as before these speed changes.
 
+## Benchmarks (Qwen3.8-27B NariQ 3.0bpw, one RTX 5060 Ti)
+
+`llama-server` with `TQ_I8=1`, KV q4_0, `-fa on`, greedy, 4 parallel slots, 16384-token budget
+(AIME26, thinking on), and the same binary with `TQ_I8` unset as the control:
+
+| benchmark | INT8 prefill | FP16 prefill |
+|---|---:|---:|
+| AIME26 full (30) | **80.0 %** (24/30) | 73.3 % (22/30) |
+| MMLU-Pro (70) | 65.7 % | 71.4 % |
+| C-Eval (20) | 80.0 % | 75.0 % |
+
+Per-question agreement between the two paths: AIME 93.3 % (28/30, INT8 wins 2, loses 0),
+MMLU-Pro 88.6 %, C-Eval 95.0 %. At these sample sizes the differences are inside the noise
+(binomial SE is 8 points on 30 questions); the deterministic alignment is in "Correctness"
+above. For reference, the same model with llama.cpp's IQ3_S quant (12.4 GB, no trellis) scores
+80.0 % on the same AIME setup; this 10.1 GB file matches it.
+
+The MLP chain fusion is what a 488-token prompt mostly does *not* see; end-to-end the prefill
+speedup shows up on long prompts and on the `pp8192` figure above.
+
 ## Limits / next steps
 
 - Activation quantization is per-row; per-block scales (e.g. one per 32-64 K elements)
